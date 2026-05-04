@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { jsPDF } from "jspdf";
 import {
   BarChart3,
@@ -21,6 +21,7 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
+import { plans, isPaidPlan } from "../lib/plans";
 import { appPayload, isSupabaseConfigured, supabase } from "../lib/supabase";
 import { Toast } from "../components/Toast";
 
@@ -142,6 +143,37 @@ function invoiceSummary(invoice) {
   return `${items[0].name} + ${items.length - 1} more`;
 }
 
+function currentMonthInvoices(invoicesList) {
+  return invoicesList.filter((invoice) => monthFromDate(invoice.date) === todayIso().slice(0, 7));
+}
+
+function currentMonthExpenses(expensesList) {
+  return expensesList.filter((expense) => monthFromDate(expense.date) === todayIso().slice(0, 7));
+}
+
+function canAddInvoice(planKey, invoicesList) {
+  const limit = plans[planKey]?.limits?.invoicesPerMonth;
+  if (limit === null) return true;
+  return currentMonthInvoices(invoicesList).length < limit;
+}
+
+function canAddExpense(planKey, expensesList) {
+  const limit = plans[planKey]?.limits?.expensesPerMonth;
+  if (limit === null) return true;
+  return currentMonthExpenses(expensesList).length < limit;
+}
+
+function canAddCustomer(planKey, customersList) {
+  const limit = plans[planKey]?.limits?.maxCustomers;
+  if (limit === null) return true;
+  return customersList.length < limit;
+}
+
+function getUsagePercent(current, limit) {
+  if (!limit) return 0;
+  return Math.round((current / limit) * 100);
+}
+
 function QuickModal({ title, onClose, children }) {
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={title}>
@@ -191,6 +223,19 @@ export default function Home() {
     logoName: "",
     logoData: "",
   });
+  const [subscription, setSubscription] = useState({
+    plan: "free",
+    status: "active",
+    currentPeriodEnd: null,
+  });
+  const [latestPayment, setLatestPayment] = useState(null);
+  const [subscriptionOpen, setSubscriptionOpen] = useState(false);
+  const [paymentOpen, setPaymentOpen] = useState(false);
+  const [selectedPlan, setSelectedPlan] = useState(null);
+  const [paymentPhone, setPaymentPhone] = useState("");
+  const subscriptionChannelRef = useRef(null);
+  const appDataChannelRef = useRef(null);
+  const paymentChannelRef = useRef(null);
 
   function showToast(message, type = "info", duration = 3000) {
     const id = Date.now();
@@ -207,6 +252,37 @@ export default function Home() {
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
   }
 
+  function normalizeSubscription(payload) {
+    return {
+      plan: payload?.plan || "free",
+      status: payload?.status || "active",
+      currentPeriodEnd: payload?.currentPeriodEnd || payload?.current_period_end || null,
+    };
+  }
+
+  function normalizePhone(value) {
+    const digits = String(value || "").replace(/\D/g, "");
+    if (digits.startsWith("254") && digits.length === 12) return digits;
+    if (digits.startsWith("0") && digits.length === 10) return `254${digits.slice(1)}`;
+    if ((digits.startsWith("7") || digits.startsWith("1")) && digits.length === 9) return `254${digits}`;
+    return value;
+  }
+
+  function paymentStatusCopy(status) {
+    switch (status) {
+      case "paid":
+        return "Payment confirmed";
+      case "failed":
+        return "Payment failed";
+      case "processing":
+        return "Waiting for M-Pesa PIN";
+      case "pending":
+        return "Preparing payment";
+      default:
+        return "No payment in progress";
+    }
+  }
+
   useEffect(() => {
     setInvoices(readStored("taxapp.invoices", initialInvoices));
     setExpenses(readStored("taxapp.expenses", initialExpenses));
@@ -214,6 +290,7 @@ export default function Home() {
     setGeneratedDocs(readStored("taxapp.generatedDocs", []));
     setBusiness(readStored("taxapp.business", business));
     setTaxSettings(readStored("taxapp.taxSettings", taxSettings));
+    setSubscription(readStored("taxapp.subscription", subscription));
     setOnboardingOpen(!window.localStorage.getItem("taxapp.onboarded"));
     if (!supabase) {
       setAuthChecked(true);
@@ -231,6 +308,110 @@ export default function Home() {
     });
     return () => listener.subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (!supabase || !user?.id) {
+      if (subscriptionChannelRef.current) {
+        supabase?.removeChannel(subscriptionChannelRef.current);
+        subscriptionChannelRef.current = null;
+      }
+      if (appDataChannelRef.current) {
+        supabase?.removeChannel(appDataChannelRef.current);
+        appDataChannelRef.current = null;
+      }
+      if (paymentChannelRef.current) {
+        supabase?.removeChannel(paymentChannelRef.current);
+        paymentChannelRef.current = null;
+      }
+      return;
+    }
+
+    setSyncStatus("Live sync on");
+
+    const subscriptionChannel = supabase
+      .channel(`subscription-${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "subscriptions",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          if (!payload.new) return;
+          setSubscription(
+            normalizeSubscription({
+              plan: payload.new.plan,
+              status: payload.new.status,
+              current_period_end: payload.new.current_period_end,
+            })
+          );
+          showToast("Subscription updated", "success", 2000);
+        }
+      )
+      .subscribe();
+
+    const appDataChannel = supabase
+      .channel(`app-data-${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "app_data",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          const nextPayload = payload.new?.payload;
+          if (!nextPayload) return;
+          if (nextPayload.business) setBusiness(nextPayload.business);
+          if (nextPayload.taxSettings) setTaxSettings(nextPayload.taxSettings);
+          if (nextPayload.subscription) setSubscription(normalizeSubscription(nextPayload.subscription));
+          if (Array.isArray(nextPayload.customers)) setCustomers(nextPayload.customers);
+          if (Array.isArray(nextPayload.invoices)) setInvoices(nextPayload.invoices);
+          if (Array.isArray(nextPayload.expenses)) setExpenses(nextPayload.expenses);
+        }
+      )
+      .subscribe();
+
+    const paymentChannel = supabase
+      .channel(`subscription-payments-${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "subscription_payments",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          if (!payload.new) return;
+          setLatestPayment(payload.new);
+          if (payload.new.status === "paid") {
+            setPaymentOpen(false);
+            setSelectedPlan(null);
+            showToast("Payment confirmed. Plan activated.", "success", 3000);
+          } else if (payload.new.status === "failed") {
+            showToast(payload.new.result_desc || "Payment failed.", "error");
+          }
+        }
+      )
+      .subscribe();
+
+    subscriptionChannelRef.current = subscriptionChannel;
+    appDataChannelRef.current = appDataChannel;
+    paymentChannelRef.current = paymentChannel;
+
+    return () => {
+      supabase.removeChannel(subscriptionChannel);
+      supabase.removeChannel(appDataChannel);
+      supabase.removeChannel(paymentChannel);
+      subscriptionChannelRef.current = null;
+      appDataChannelRef.current = null;
+      paymentChannelRef.current = null;
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     window.localStorage.setItem("taxapp.invoices", JSON.stringify(invoices));
@@ -255,6 +436,16 @@ export default function Home() {
   useEffect(() => {
     window.localStorage.setItem("taxapp.taxSettings", JSON.stringify(taxSettings));
   }, [taxSettings]);
+
+  useEffect(() => {
+    window.localStorage.setItem("taxapp.subscription", JSON.stringify(subscription));
+  }, [subscription]);
+
+  useEffect(() => {
+    if (!paymentPhone && business.phone) {
+      setPaymentPhone(normalizePhone(business.phone));
+    }
+  }, [business.phone, paymentPhone]);
 
   const totals = useMemo(() => {
     const monthInvoices = invoices.filter((invoice) => monthFromDate(invoice.date) === reportMonth);
@@ -331,6 +522,13 @@ export default function Home() {
       return;
     }
 
+    if (!canAddInvoice(subscription.plan, invoices)) {
+      const limit = plans[subscription.plan].limits.invoicesPerMonth;
+      showToast(`Reached ${limit} invoices/month limit. Upgrade to Pro or Enterprise.`, "warning");
+      setSubscriptionOpen(true);
+      return;
+    }
+
     const invoice = {
       id: Date.now(),
       number: nextInvoiceNumber(invoices.length),
@@ -379,6 +577,13 @@ export default function Home() {
     }
     if (!date) {
       showToast("Select an expense date", "error");
+      return;
+    }
+
+    if (!canAddExpense(subscription.plan, expenses)) {
+      const limit = plans[subscription.plan].limits.expensesPerMonth;
+      showToast(`Reached ${limit} expenses/month limit. Upgrade to Pro or Enterprise.`, "warning");
+      setSubscriptionOpen(true);
       return;
     }
     
@@ -461,8 +666,27 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  async function ensureSubscriptionRecord(userId, nextSubscription = subscription) {
+    if (!supabase) return { data: null, error: null };
+    return supabase
+      .from("subscriptions")
+      .upsert(
+        {
+          user_id: userId,
+          plan: nextSubscription.plan,
+          status: nextSubscription.status,
+          current_period_end: nextSubscription.currentPeriodEnd,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" }
+      )
+      .select()
+      .single();
+  }
+
   async function loadCloudData(userId) {
     if (!supabase) return;
+    setSyncStatus("Syncing...");
     const { data, error } = await supabase
       .from("app_data")
       .select("payload")
@@ -475,31 +699,89 @@ export default function Home() {
     if (data?.payload) {
       if (data.payload.business) setBusiness(data.payload.business);
       if (data.payload.taxSettings) setTaxSettings(data.payload.taxSettings);
+      if (data.payload.subscription) setSubscription(normalizeSubscription(data.payload.subscription));
       if (Array.isArray(data.payload.customers)) setCustomers(data.payload.customers);
       if (Array.isArray(data.payload.invoices)) setInvoices(data.payload.invoices);
       if (Array.isArray(data.payload.expenses)) setExpenses(data.payload.expenses);
       showToast("Cloud data loaded", "success", 2000);
     }
+    const { data: subData, error: subError } = await supabase
+      .from("subscriptions")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (subError) {
+      showToast("Could not load subscription", "error");
+      setSyncStatus("Subscription sync error");
+      return;
+    }
+
+    if (subData) {
+      setSubscription(normalizeSubscription(subData));
+    } else {
+      const localSubscription = data?.payload?.subscription
+        ? normalizeSubscription(data.payload.subscription)
+        : normalizeSubscription(subscription);
+      const { data: createdSubscription, error: createError } = await ensureSubscriptionRecord(userId, localSubscription);
+      if (createError) {
+        showToast("Could not create your subscription record", "error");
+        setSyncStatus("Subscription sync error");
+        return;
+      }
+      if (createdSubscription) {
+        setSubscription(normalizeSubscription(createdSubscription));
+      }
+    }
+
+    const { data: paymentData } = await supabase
+      .from("subscription_payments")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (paymentData) {
+      setLatestPayment(paymentData);
+    }
+
+    setSyncStatus("Live sync on");
   }
 
-  async function saveCloudData() {
+  async function saveCloudData(override = {}) {
     if (!supabase || !user) {
       setAuthInlineOpen(true);
       return;
     }
     setLoadingStates((prev) => ({ ...prev, saveCloud: true }));
+    setSyncStatus("Saving...");
     const toastId = showToast("Saving to cloud...", "loading", 0);
-    const payload = appPayload({ business, taxSettings, customers, invoices, expenses });
-    const { error } = await supabase.from("app_data").upsert({
-      user_id: user.id,
-      payload,
-      updated_at: new Date().toISOString(),
+    const payload = appPayload({
+      business: override.business || business,
+      taxSettings: override.taxSettings || taxSettings,
+      customers: override.customers || customers,
+      invoices: override.invoices || invoices,
+      expenses: override.expenses || expenses,
+      subscription: normalizeSubscription(override.subscription || subscription),
     });
+    const { error } = await supabase
+      .from("app_data")
+      .upsert(
+        {
+          user_id: user.id,
+          payload,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" }
+      );
     closeToast(toastId);
     setLoadingStates((prev) => ({ ...prev, saveCloud: false }));
     if (error) {
+      setSyncStatus("Cloud save failed");
       showToast("Failed to save to cloud", "error");
     } else {
+      setSyncStatus("Live sync on");
       showToast("Saved to cloud", "success", 2000);
     }
   }
@@ -563,6 +845,10 @@ export default function Home() {
     setAuthOpen(false);
     setAuthInlineOpen(false);
     setLoadingStates((prev) => ({ ...prev, auth: false }));
+    if (nextUser) {
+      await ensureSubscriptionRecord(nextUser.id, normalizeSubscription(subscription));
+      await loadCloudData(nextUser.id);
+    }
     if (mode === "signup" && !result.data.session) {
       showToast("Account created. Check email to confirm.", "success");
     } else {
@@ -579,8 +865,97 @@ export default function Home() {
     if (!supabase) return;
     await supabase.auth.signOut();
     setUser(null);
+    setLatestPayment(null);
+    setPaymentOpen(false);
+    setSelectedPlan(null);
     setAuthMode("signin");
+    setSyncStatus(isSupabaseConfigured ? "Cloud ready" : "Local mode");
     showToast("Signed out", "info", 2000);
+  }
+
+  async function downgradeToFreePlan() {
+    if (!user) {
+      setAuthInlineOpen(true);
+      return;
+    }
+    setLoadingStates((prev) => ({ ...prev, upgrade: true }));
+    const downgradedSubscription = normalizeSubscription({
+      plan: "free",
+      status: "active",
+      currentPeriodEnd: null,
+    });
+    const { data: savedSubscription, error } = await ensureSubscriptionRecord(user.id, downgradedSubscription);
+    if (error) {
+      setLoadingStates((prev) => ({ ...prev, upgrade: false }));
+      showToast("Could not change your plan", "error");
+      return;
+    }
+    const nextSubscription = savedSubscription ? normalizeSubscription(savedSubscription) : downgradedSubscription;
+    setSubscription(nextSubscription);
+    await saveCloudData({ subscription: nextSubscription });
+    setSubscriptionOpen(false);
+    setLoadingStates((prev) => ({ ...prev, upgrade: false }));
+    showToast("Moved back to Free plan", "success", 3000);
+  }
+
+  function openPaymentCheckout(planKey) {
+    if (!user) {
+      setAuthInlineOpen(true);
+      return;
+    }
+    setSelectedPlan(planKey);
+    setPaymentPhone((current) => normalizePhone(current || business.phone || ""));
+    setPaymentOpen(true);
+  }
+
+  async function requestPlanPayment(event) {
+    event.preventDefault();
+    if (!user) {
+      setAuthInlineOpen(true);
+      return;
+    }
+    if (!selectedPlan || !isPaidPlan(selectedPlan)) {
+      showToast("Choose a paid plan first", "error");
+      return;
+    }
+    setLoadingStates((prev) => ({ ...prev, payment: true }));
+    try {
+      const { data } = await supabase.auth.getSession();
+      const accessToken = data.session?.access_token;
+      if (!accessToken) {
+        throw new Error("Your session expired. Please sign in again.");
+      }
+      const response = await fetch("/api/payments/mpesa/upgrade", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          planKey: selectedPlan,
+          phoneNumber: paymentPhone,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || "Could not start the M-Pesa payment.");
+      }
+      setLatestPayment((prev) => ({
+        ...prev,
+        id: result.paymentId,
+        plan: selectedPlan,
+        phone_number: normalizePhone(paymentPhone),
+        amount: plans[selectedPlan].price,
+        status: result.status,
+        result_desc: result.message,
+      }));
+      setSubscriptionOpen(false);
+      showToast("STK push sent. Ask the client to enter their M-Pesa PIN.", "success", 4000);
+    } catch (error) {
+      showToast(error.message || "Could not start the payment.", "error");
+    } finally {
+      setLoadingStates((prev) => ({ ...prev, payment: false }));
+    }
   }
 
   function handleLogoUpload(event) {
@@ -1127,6 +1502,22 @@ export default function Home() {
                   </>
                 )}
               </div>
+              <div className="cloud-panel account-panel">
+                <strong>Current Plan: {plans[subscription.plan]?.name || "Free"}</strong>
+                <span>Status: {subscription.status}</span>
+                {latestPayment && (
+                  <div className="subscription-meta">
+                    <span>
+                      Latest payment: {paymentStatusCopy(latestPayment.status)}
+                      {latestPayment.amount ? ` - ${currency.format(latestPayment.amount)}` : ""}
+                    </span>
+                    {latestPayment.plan && <span>Requested plan: {plans[latestPayment.plan]?.name || latestPayment.plan}</span>}
+                  </div>
+                )}
+                <button className="primary-wide" type="button" onClick={() => setSubscriptionOpen(true)}>
+                  Manage Subscription
+                </button>
+              </div>
               <form className="form settings-form">
                 <label>
                   Business Name
@@ -1404,6 +1795,100 @@ export default function Home() {
               Add your Supabase URL and anon key in <strong>.env.local</strong>, then restart the app.
             </div>
           )}
+        </QuickModal>
+      )}
+
+      {subscriptionOpen && (
+        <QuickModal title="Choose Your Plan" onClose={() => setSubscriptionOpen(false)}>
+          <div className="plans-grid">
+            {Object.entries(plans).map(([key, plan]) => (
+              <article key={key} className={`plan-card ${subscription.plan === key ? "current" : ""}`}>
+                <div className="plan-header">
+                  <h3>{plan.name}</h3>
+                  {subscription.plan === key && <span className="current-badge">Current</span>}
+                </div>
+                <div className="plan-price">
+                  {plan.price === 0 ? (
+                    <span>Free</span>
+                  ) : (
+                    <>
+                      <strong>{plan.priceDisplay}</strong>
+                      <span>/month</span>
+                    </>
+                  )}
+                </div>
+                <ul className="plan-features">
+                  {plan.features.map((feature, index) => (
+                    <li key={index}>
+                      <Check size={16} />
+                      {feature}
+                    </li>
+                  ))}
+                </ul>
+                {subscription.plan !== key && (
+                  <button
+                    className="primary-wide"
+                    onClick={() => (plan.price === 0 ? downgradeToFreePlan() : openPaymentCheckout(key))}
+                    disabled={loadingStates.upgrade || loadingStates.payment}
+                  >
+                    {loadingStates.upgrade
+                      ? "Saving..."
+                      : loadingStates.payment && selectedPlan === key
+                        ? "Waiting..."
+                        : plan.price === 0
+                          ? "Downgrade"
+                          : `Pay ${plan.priceDisplay}`}
+                  </button>
+                )}
+              </article>
+            ))}
+          </div>
+          <p className="plan-note">
+            Paid plans activate only after M-Pesa confirms the payment.
+          </p>
+        </QuickModal>
+      )}
+
+      {paymentOpen && selectedPlan && (
+        <QuickModal title={`Pay for ${plans[selectedPlan].name}`} onClose={() => setPaymentOpen(false)}>
+          <form className="form" onSubmit={requestPlanPayment}>
+            <div className="auto-row">
+              <span>Plan</span>
+              <strong>{plans[selectedPlan].name}</strong>
+            </div>
+            <div className="auto-row">
+              <span>Amount</span>
+              <strong>{currency.format(plans[selectedPlan].price)}</strong>
+            </div>
+            <label>
+              Customer M-Pesa Phone
+              <input
+                value={paymentPhone}
+                onChange={(event) => setPaymentPhone(event.target.value)}
+                placeholder="07XXXXXXXX or 2547XXXXXXXX"
+                required
+                autoFocus
+              />
+            </label>
+            <div className="empty-note payment-note">
+              The plan will stay locked until the customer accepts the M-Pesa STK push and enters their PIN.
+            </div>
+            {latestPayment && ["pending", "processing", "failed"].includes(latestPayment.status) && (
+              <div className="payment-status-card">
+                <strong>{paymentStatusCopy(latestPayment.status)}</strong>
+                <span>{latestPayment.result_desc || "Waiting for payment update."}</span>
+              </div>
+            )}
+            <div className="action-stack">
+              <button className="primary-wide" type="submit" disabled={loadingStates.payment}>
+                <CircleDollarSign size={22} />
+                {loadingStates.payment ? "Sending STK Push..." : `Pay ${currency.format(plans[selectedPlan].price)}`}
+              </button>
+              <button className="secondary-wide" type="button" onClick={() => setPaymentOpen(false)} disabled={loadingStates.payment}>
+                Cancel
+              </button>
+            </div>
+          </form>
         </QuickModal>
       )}
 
